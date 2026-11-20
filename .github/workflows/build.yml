@@ -1,0 +1,261 @@
+name: Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'لینک سایت'
+        required: true
+        default: 'https://example.com'
+        type: string
+      app_name:
+        description: 'اسم اپ (فارسی هم می‌شه)'
+        required: false
+        default: 'اپ من'
+        type: string
+      package_id:
+        description: 'Package ID (اختیاری - خالی=خودکار از روی لینک، برای نصب چند اپ کنار هم)'
+        required: false
+        default: ''
+        type: string
+      icon_url:
+        description: 'لینک مستقیم تصویر آیکون (اختیاری - خالی=آیکون فعلی بمونه)'
+        required: false
+        default: ''
+        type: string
+      fullscreen:
+        description: 'نمایش تمام‌صفحه (edge-to-edge)'
+        required: false
+        default: true
+        type: boolean
+      status_color:
+        description: 'رنگ نوار وضعیت بالا (وقتی تمام‌صفحه خاموشه)'
+        required: false
+        default: '#FFFFFF'
+        type: string
+      nav_color:
+        description: 'رنگ زیر خط اپ‌های اخیر/پایین (وقتی تمام‌صفحه خاموشه)'
+        required: false
+        default: '#FFFFFF'
+        type: string
+      zoom_percent:
+        description: 'زوم صفحه به درصد (پیش‌فرض ۹۹)'
+        required: false
+        default: '99'
+        type: string
+      default_zoom:
+        description: 'زوم پیش‌فرض وب‌ویو (تیک بزنی عدد بالا نادیده گرفته می‌شه)'
+        required: false
+        default: false
+        type: boolean
+      build_release:
+        description: 'ساخت نسخه‌ی Release امضاشده (نیاز به ۴ تا Secret)'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      SITE_URL: ${{ github.event.inputs.site_url || 'https://example.com' }}
+      APP_NAME: ${{ github.event.inputs.app_name || 'اپ من' }}
+      PACKAGE_ID: ${{ github.event.inputs.package_id || '' }}
+      ICON_URL: ${{ github.event.inputs.icon_url || '' }}
+      FULLSCREEN: ${{ github.event.inputs.fullscreen || 'true' }}
+      STATUS_COLOR: ${{ github.event.inputs.status_color || '#FFFFFF' }}
+      NAV_COLOR: ${{ github.event.inputs.nav_color || '#FFFFFF' }}
+      ZOOM_PERCENT: ${{ github.event.inputs.zoom_percent || '99' }}
+      ZOOM_DEFAULT: ${{ github.event.inputs.default_zoom == 'true' }}
+      HAS_RELEASE_SIGNING: ${{ secrets.KEYSTORE_BASE64 != '' }}
+      WANT_RELEASE: ${{ github.event.inputs.build_release == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # اولویت با لینکِ آیکون (icon_url)؛ اگه لینک بد باشه بیلد صریح خطا می‌ده (بی‌صدا آیکون قبلی نمی‌مونه)
+      - name: Process icon (from icon_url, or icon.png in repo)
+        run: |
+          pip install --quiet pillow
+          python3 - <<'PY'
+          import os, io, re, sys, urllib.request, urllib.parse
+          from PIL import Image, ImageDraw
+
+          def fail(msg):
+              print('::error::' + msg)
+              sys.exit(1)
+
+          def normalize(u):
+              m = re.search(r'drive\.google\.com/file/d/([^/]+)', u)
+              if m: return 'https://drive.google.com/uc?export=download&id=' + m.group(1)
+              if 'dropbox.com' in u:
+                  u = re.sub(r'[?&]dl=0', '', u)
+                  return u + ('&' if '?' in u else '?') + 'dl=1'
+              return u
+
+          def fetch(u):
+              req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36', 'Accept': 'image/*,*/*;q=0.8'})
+              return urllib.request.urlopen(req, timeout=30).read()
+
+          def open_img(data):
+              try:
+                  return Image.open(io.BytesIO(data))
+              except Exception:
+                  return None
+
+          im = None
+          icon_url = os.environ.get('ICON_URL', '').strip()
+          if icon_url:
+              url = normalize(icon_url)
+              print('downloading icon:', url)
+              try:
+                  data = fetch(url)
+              except Exception as e:
+                  fail('لینک آیکون دانلود نشد (%s). لینک باید مستقیم و عمومی باشه.' % e)
+              im = open_img(data)
+              if im is None:
+                  # شاید لینک یه صفحه‌ی وب باشه؛ تصویر اصلیِ صفحه (og:image) رو پیدا کن
+                  html = data.decode('utf-8', 'ignore')
+                  m = (re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*content=["\']([^"\']+)', html, re.I)
+                       or re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\'](?:og:image|twitter:image)["\']', html, re.I)
+                       or re.search(r'<link[^>]+rel=["\']image_src["\'][^>]*href=["\']([^"\']+)', html, re.I))
+                  if m:
+                      img_url = urllib.parse.urljoin(url, m.group(1).replace('&amp;', '&'))
+                      print('link was a web page; using its image:', img_url)
+                      try:
+                          im = open_img(fetch(img_url))
+                      except Exception as e:
+                          fail('تصویر داخل صفحه دانلود نشد: %s' % e)
+              if im is None:
+                  fail('محتوای این لینک تصویر نبود (PNG/JPG/WebP). لینک مستقیم فایل تصویر رو بده (نه SVG و نه صفحه‌ی وب).')
+              print('icon source: %dx%d %s' % (im.size[0], im.size[1], im.format))
+          elif os.path.exists('icon.png'):
+              im = Image.open('icon.png')
+              print('using icon.png from repo root')
+
+          if im is not None:
+              im = im.convert('RGBA')
+              w, h = im.size
+              s = min(w, h)
+              im = im.crop(((w - s)//2, (h - s)//2, (w - s)//2 + s, (h - s)//2 + s))
+              sizes = {'mdpi':48, 'hdpi':72, 'xhdpi':96, 'xxhdpi':144, 'xxxhdpi':192}
+              for name, sz in sizes.items():
+                  d = 'app/src/main/res/mipmap-' + name
+                  os.makedirs(d, exist_ok=True)
+                  r = im.resize((sz, sz), Image.LANCZOS)
+                  r.save(d + '/ic_launcher.png')
+                  mask = Image.new('L', (sz, sz), 0)
+                  ImageDraw.Draw(mask).ellipse((0, 0, sz, sz), fill=255)
+                  rc = r.copy(); rc.putalpha(mask)
+                  rc.save(d + '/ic_launcher_round.png')
+              print('::notice::icon applied to all mipmap sizes')
+          else:
+              print('no icon source given — keeping the default icon')
+          PY
+
+      - name: Apply site url + fullscreen/colors
+        run: |
+          python3 - <<'PY'
+          import os, re
+          f = 'app/src/main/java/com/example/myapp/MainActivity.java'
+          s = open(f, encoding='utf-8').read()
+          fullscreen = os.environ['FULLSCREEN'] == 'true'
+          if fullscreen:
+              block = ('WindowCompat.setDecorFitsSystemWindows(getWindow(), false);\n'
+                  '        getWindow().setStatusBarColor(Color.TRANSPARENT);\n'
+                  '        getWindow().setNavigationBarColor(Color.TRANSPARENT);\n'
+                  '        WindowInsetsControllerCompat ic = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());\n'
+                  '        if (ic != null) { ic.setAppearanceLightStatusBars(false); ic.setAppearanceLightNavigationBars(false); }\n'
+                  '        if (Build.VERSION.SDK_INT >= 29) { getWindow().setNavigationBarContrastEnforced(false); getWindow().setStatusBarContrastEnforced(false); }')
+          else:
+              block = ('getWindow().setStatusBarColor(Color.parseColor("%s"));\n'
+                  '        getWindow().setNavigationBarColor(Color.parseColor("%s"));'
+                  % (os.environ['STATUS_COLOR'], os.environ['NAV_COLOR']))
+          s = re.sub(r'// >>> WINDOW_SETUP_START.*?// >>> WINDOW_SETUP_END',
+                      '// >>> WINDOW_SETUP_START\n        ' + block + '\n        // >>> WINDOW_SETUP_END',
+                      s, flags=re.S)
+          try:
+              zoom = int(float(os.environ['ZOOM_PERCENT'].replace('%', '').strip()))
+              if not 25 <= zoom <= 500: zoom = 99
+          except Exception:
+              zoom = 99
+          zoom_line = '// zoom: default' if os.environ['ZOOM_DEFAULT'] == 'true' else 'settings.setTextZoom(%d);' % zoom
+          s = re.sub(r'// >>> ZOOM_START.*?// >>> ZOOM_END',
+                      '// >>> ZOOM_START\n        ' + zoom_line + '\n        // >>> ZOOM_END',
+                      s, flags=re.S)
+          from xml.sax.saxutils import escape
+          name = os.environ['APP_NAME'].strip() or 'اپ من'
+          name = escape(name).replace("'", "\\'").replace('"', '\\"')
+          sf = 'app/src/main/res/values/strings.xml'
+          x = open(sf, encoding='utf-8').read()
+          x = re.sub(r'(<string name="app_name">).*?(</string>)', lambda m: m.group(1) + name + m.group(2), x)
+          open(sf, 'w', encoding='utf-8').write(x)
+          import hashlib, urllib.parse
+          pid = os.environ.get('PACKAGE_ID', '').strip().lower()
+          if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+', pid):
+              url = os.environ['SITE_URL']
+              host = (urllib.parse.urlparse(url).hostname or 'site').lower()
+              host = re.sub(r'[^a-z0-9]+', '_', host).strip('_') or 'site'
+              if not host[0].isalpha(): host = 's' + host
+              pid = 'com.webapp.%s_%s' % (host[:40], hashlib.sha1(url.encode()).hexdigest()[:6])
+          gf = 'app/build.gradle'
+          g = open(gf, encoding='utf-8').read()
+          g = re.sub(r'applicationId ".*?"', 'applicationId "%s"' % pid, g)
+          open(gf, 'w', encoding='utf-8').write(g)
+          print('applicationId =', pid)
+          s = re.sub(r'SITE_URL = ".*?";', 'SITE_URL = "%s";' % os.environ['SITE_URL'], s)
+          open(f, 'w', encoding='utf-8').write(s)
+          PY
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
+      - name: Ensure debug keystore
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkey -v -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      # فقط وقتی تیکِ «ساخت Release» تو دراپ‌دون زده شده باشه *و* ۴ تا Secret ست شده باشن
+      - name: Decode Keystore
+        if: ${{ env.WANT_RELEASE == 'true' && env.HAS_RELEASE_SIGNING == 'true' }}
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > app/release.keystore
+
+      - name: Build Signed Release APK
+        if: ${{ env.WANT_RELEASE == 'true' && env.HAS_RELEASE_SIGNING == 'true' }}
+        run: |
+          gradle assembleRelease \
+            -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/app/release.keystore \
+            -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }} \
+            -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }} \
+            -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ env.WANT_RELEASE == 'true' && env.HAS_RELEASE_SIGNING == 'true' }}
+        with:
+          name: app-release
+          path: app/build/outputs/apk/release/app-release.apk
