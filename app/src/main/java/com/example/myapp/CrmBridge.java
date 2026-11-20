@@ -10,11 +10,17 @@ import android.net.Uri;
 import android.os.Build;
 import android.provider.CallLog;
 import android.provider.Settings;
+import android.util.Base64;
 import android.webkit.JavascriptInterface;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -106,5 +112,75 @@ public class CrmBridge {
             }
         } catch (Exception e) { return err("query"); }
         return out.toString();
+    }
+
+    // ---------- ضبط (آزمایشی) ----------
+    @JavascriptInterface
+    public String recStatus() {
+        if (!act.crmOn()) return err("feature_off");
+        try {
+            File[] fs = CallRecorder.dir(act).listFiles();
+            return new JSONObject().put("recording", CallRecorder.recording).put("source", CallRecorder.getSource(act))
+                .put("error", CallRecorder.lastError).put("regError", CrmAccessibilityService.regError)
+                .put("a11y", a11yOn(act)).put("files", fs == null ? 0 : fs.length).toString();
+        } catch (Exception e) { return err("json"); }
+    }
+
+    @JavascriptInterface
+    public String recSetSource(String s) {
+        if (!act.crmOn()) return err("feature_off");
+        if (!Arrays.asList("voice_recognition", "mic", "voice_communication", "unprocessed", "camcorder").contains(s)) return err("bad_source");
+        CallRecorder.setSource(act, s);
+        return "{\"ok\":true}";
+    }
+
+    // ضبط دستی برای تست خودِ MediaRecorder (بیرون از تماس)
+    @JavascriptInterface
+    public String recManual(boolean start) {
+        if (!act.crmOn()) return err("feature_off");
+        if (start) CallRecorder.I.start(act); else CallRecorder.I.stop();
+        return recStatus();
+    }
+
+    @JavascriptInterface
+    public String recList() {
+        if (!act.crmOn()) return err("feature_off");
+        JSONArray out = new JSONArray();
+        try {
+            File[] fs = CallRecorder.dir(act).listFiles();
+            if (fs != null) {
+                Arrays.sort(fs, Comparator.comparingLong(File::lastModified).reversed());
+                for (int i = 0; i < fs.length && i < 20; i++)
+                    out.put(new JSONObject().put("name", fs[i].getName()).put("size", fs[i].length()).put("date", fs[i].lastModified()));
+            }
+        } catch (Exception e) { return err("list"); }
+        return out.toString();
+    }
+
+    private File recFile(String name) {
+        if (name == null || name.contains("/") || name.contains("\\") || name.contains("..")) return null;
+        File f = new File(CallRecorder.dir(act), name);
+        return f.isFile() ? f : null;
+    }
+
+    // برای پخش مستقیم در صفحه‌ی تست (فایل‌های کوتاه)
+    @JavascriptInterface
+    public String recBase64(String name) {
+        if (!act.crmOn()) return err("feature_off");
+        File f = recFile(name);
+        if (f == null) return err("not_found");
+        if (f.length() > 6L * 1024 * 1024) return err("too_big");
+        try (FileInputStream in = new FileInputStream(f); ByteArrayOutputStream bo = new ByteArrayOutputStream()) {
+            byte[] b = new byte[16384]; int n;
+            while ((n = in.read(b)) > 0) bo.write(b, 0, n);
+            return new JSONObject().put("mime", "audio/mp4").put("data", Base64.encodeToString(bo.toByteArray(), Base64.NO_WRAP)).toString();
+        } catch (Exception e) { return err("read"); }
+    }
+
+    @JavascriptInterface
+    public String recDelete(String name) {
+        if (!act.crmOn()) return err("feature_off");
+        File f = recFile(name);
+        return f != null && f.delete() ? "{\"ok\":true}" : err("not_found");
     }
 }
