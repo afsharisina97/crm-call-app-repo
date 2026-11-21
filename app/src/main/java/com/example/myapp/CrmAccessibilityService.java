@@ -2,6 +2,7 @@ package com.example.myapp;
 
 import android.accessibilityservice.AccessibilityService;
 import android.content.Context;
+import java.io.File;
 import android.os.Build;
 import android.telephony.PhoneStateListener;
 import android.telephony.TelephonyCallback;
@@ -20,7 +21,7 @@ public class CrmAccessibilityService extends AccessibilityService {
     private boolean registered = false;
     private int last = TelephonyManager.CALL_STATE_IDLE;
 
-    @Override protected void onServiceConnected() { running = true; ensureRegistered(); }
+    @Override protected void onServiceConnected() { running = true; ensureRegistered(); RecUploader.flush(this); }
 
     @Override public boolean onUnbind(android.content.Intent i) { unregister(); running = false; return super.onUnbind(i); }
     @Override public void onDestroy() { unregister(); running = false; super.onDestroy(); }
@@ -31,8 +32,14 @@ public class CrmAccessibilityService extends AccessibilityService {
 
     private void onState(int s) {
         if (s == TelephonyManager.CALL_STATE_OFFHOOK && last != TelephonyManager.CALL_STATE_OFFHOOK) CallRecorder.I.start(this);
-        else if (s == TelephonyManager.CALL_STATE_IDLE && last == TelephonyManager.CALL_STATE_OFFHOOK) CallRecorder.I.stop();
+        else if (s == TelephonyManager.CALL_STATE_IDLE && last == TelephonyManager.CALL_STATE_OFFHOOK) finishRec();
         last = s;
+    }
+
+    private void finishRec() {
+        long st = CallRecorder.startedAt;
+        File f = CallRecorder.I.stop();
+        if (f != null) RecUploader.enqueue(this, f, st, System.currentTimeMillis(), false, CallRecorder.peak, CallRecorder.getSource(this));
     }
 
     private void ensureRegistered() {
@@ -65,7 +72,7 @@ public class CrmAccessibilityService extends AccessibilityService {
             }
         } catch (Exception ignored) {}
         registered = false;
-        CallRecorder.I.stop();
+        finishRec();
     }
 
     @RequiresApi(31)

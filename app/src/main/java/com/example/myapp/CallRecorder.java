@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.media.MediaRecorder;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import androidx.core.content.ContextCompat;
 import java.io.File;
 import java.text.SimpleDateFormat;
@@ -18,6 +20,18 @@ public class CallRecorder {
     private static final String PREF = "crm_rec";
     public static volatile boolean recording = false;
     public static volatile String lastError = "";
+    public static volatile int peak = 0;          // بلندترین دامنه‌ی صدا؛ ۰ یعنی ضبط بی‌صدا بوده
+    public static volatile long startedAt = 0;
+    private final Handler h = new Handler(Looper.getMainLooper());
+    private final Runnable poll = new Runnable() {
+        @Override public void run() {
+            synchronized (CallRecorder.this) {
+                if (!recording || mr == null) return;
+                try { int a = mr.getMaxAmplitude(); if (a > peak) peak = a; } catch (Exception ignored) {}
+            }
+            h.postDelayed(this, 500);
+        }
+    };
     private MediaRecorder mr;
     private File cur;
 
@@ -52,7 +66,8 @@ public class CallRecorder {
             r.setAudioSource(sourceOf(src));
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-            r.setAudioEncodingBitRate(96000);
+            r.setAudioChannels(1);
+            r.setAudioEncodingBitRate(64000);
             r.setAudioSamplingRate(44100);
             r.setOutputFile(cur.getAbsolutePath());
             r.prepare();
@@ -60,6 +75,9 @@ public class CallRecorder {
             mr = r;
             recording = true;
             lastError = "";
+            peak = 0;
+            startedAt = System.currentTimeMillis();
+            h.postDelayed(poll, 500);
         } catch (Exception e) {
             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             release();
@@ -69,8 +87,10 @@ public class CallRecorder {
     public synchronized File stop() {
         if (!recording) return null;
         File f = cur;
-        try { mr.stop(); } catch (RuntimeException e) { lastError = "stop: " + e.getMessage(); }
+        boolean ok = true;
+        try { mr.stop(); } catch (RuntimeException e) { lastError = "stop: " + e.getMessage(); ok = false; }
         release();
+        if (!ok) { if (f != null) f.delete(); return null; }   // ضبط خیلی کوتاه/خراب
         return f;
     }
 

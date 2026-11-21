@@ -10,6 +10,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.provider.CallLog;
 import android.provider.Settings;
+import android.telecom.TelecomManager;
+import android.telephony.SmsManager;
 import android.util.Base64;
 import android.webkit.JavascriptInterface;
 import androidx.core.app.ActivityCompat;
@@ -30,9 +32,10 @@ public class CrmBridge {
     public static final int REQ = 400;
     private static final String[] PERMS = {
         Manifest.permission.READ_CALL_LOG, Manifest.permission.READ_PHONE_STATE,
-        Manifest.permission.READ_SMS, Manifest.permission.SEND_SMS, Manifest.permission.RECORD_AUDIO
+        Manifest.permission.READ_SMS, Manifest.permission.SEND_SMS, Manifest.permission.RECORD_AUDIO,
+        Manifest.permission.CALL_PHONE, Manifest.permission.ANSWER_PHONE_CALLS
     };
-    private static final String[] KEYS = {"call_log", "phone_state", "read_sms", "send_sms", "record_audio"};
+    private static final String[] KEYS = {"call_log", "phone_state", "read_sms", "send_sms", "record_audio", "call_phone", "answer_calls"};
     private final MainActivity act;
 
     CrmBridge(MainActivity a) { act = a; }
@@ -114,6 +117,90 @@ public class CrmBridge {
         return out.toString();
     }
 
+
+    // ---------- تماس و پیامک مستقیم ----------
+    private static String clean(String n) { return n == null ? "" : n.replaceAll("[^0-9+]", ""); }
+
+    // با مجوز CALL_PHONE مستقیم زنگ می‌زند؛ بدون مجوز فقط شماره‌گیر را با شماره‌ی پر شده باز می‌کند
+    @JavascriptInterface
+    public String call(String num) {
+        if (!act.crmOn()) return err("feature_off");
+        final String n = clean(num);
+        if (n.isEmpty()) return err("bad_number");
+        final boolean direct = has(Manifest.permission.CALL_PHONE);
+        act.runOnUiThread(() -> {
+            try { act.startActivity(new Intent(direct ? Intent.ACTION_CALL : Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(n)))); }
+            catch (Exception ignored) {}
+        });
+        return "{\"ok\":true,\"direct\":" + direct + "}";
+    }
+
+    @JavascriptInterface
+    public String endCall() {
+        if (!act.crmOn()) return err("feature_off");
+        if (Build.VERSION.SDK_INT < 28 || !has(Manifest.permission.ANSWER_PHONE_CALLS)) return err("no_permission");
+        try {
+            TelecomManager tm = (TelecomManager) act.getSystemService(Context.TELECOM_SERVICE);
+            return "{\"ok\":" + tm.endCall() + "}";
+        } catch (SecurityException e) { return err("security"); }
+    }
+
+    @JavascriptInterface
+    public String sendSms(String num, String text) {
+        if (!act.crmOn()) return err("feature_off");
+        if (!has(Manifest.permission.SEND_SMS)) return err("no_permission");
+        String n = clean(num);
+        if (n.isEmpty() || text == null || text.trim().isEmpty()) return err("bad_args");
+        try {
+            SmsManager sm = Build.VERSION.SDK_INT >= 31 ? act.getSystemService(SmsManager.class) : SmsManager.getDefault();
+            ArrayList<String> parts = sm.divideMessage(text);
+            if (parts.size() > 1) sm.sendMultipartTextMessage(n, null, parts, null, null);
+            else sm.sendTextMessage(n, null, text, null, null);
+            return "{\"ok\":true}";
+        } catch (Exception e) { return err("sms"); }
+    }
+
+
+    // ---------- ارسال ضبط‌ها به سرور ----------
+    // صفحه بعد از ورود، آدرس مطلق api.php و توکن را می‌دهد؛ ضبط‌های معطل هم همان لحظه ارسال می‌شوند
+    @JavascriptInterface
+    public String setServer(String api, String tok) {
+        if (!act.crmOn()) return err("feature_off");
+        if (api == null || !api.startsWith("http") || tok == null || tok.length() < 8) return err("bad_args");
+        RecUploader.saveServer(act, api, tok);
+        RecUploader.flush(act);
+        return "{\"ok\":true}";
+    }
+
+    @JavascriptInterface
+    public String recFlush() {
+        if (!act.crmOn()) return err("feature_off");
+        RecUploader.flush(act);
+        return recStatus();
+    }
+
+    // ---------- تنظیمات سیستم برای پایداری سرویس پس‌زمینه ----------
+    @JavascriptInterface
+    public void openBattery() {
+        if (!act.crmOn()) return;
+        act.runOnUiThread(() -> { try { act.startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)); } catch (Exception ignored) {} });
+    }
+
+    // شیائومی: «شروع خودکار»؛ اگر نبود صفحه‌ی اطلاعات اپ
+    @JavascriptInterface
+    public void openAutostart() {
+        if (!act.crmOn()) return;
+        act.runOnUiThread(() -> {
+            try {
+                Intent i = new Intent();
+                i.setComponent(new ComponentName("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity"));
+                act.startActivity(i);
+            } catch (Exception e) {
+                try { act.startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + act.getPackageName()))); } catch (Exception ignored) {}
+            }
+        });
+    }
+
     // ---------- ضبط (آزمایشی) ----------
     @JavascriptInterface
     public String recStatus() {
@@ -122,7 +209,9 @@ public class CrmBridge {
             File[] fs = CallRecorder.dir(act).listFiles();
             return new JSONObject().put("recording", CallRecorder.recording).put("source", CallRecorder.getSource(act))
                 .put("error", CallRecorder.lastError).put("regError", CrmAccessibilityService.regError)
-                .put("a11y", a11yOn(act)).put("files", fs == null ? 0 : fs.length).toString();
+                .put("a11y", a11yOn(act)).put("files", fs == null ? 0 : fs.length)
+                .put("pending", RecUploader.pending(act)).put("upErr", RecUploader.lastError).put("peak", CallRecorder.peak)
+                .put("server", RecUploader.hasServer(act)).toString();
         } catch (Exception e) { return err("json"); }
     }
 
@@ -138,7 +227,12 @@ public class CrmBridge {
     @JavascriptInterface
     public String recManual(boolean start) {
         if (!act.crmOn()) return err("feature_off");
-        if (start) CallRecorder.I.start(act); else CallRecorder.I.stop();
+        if (start) CallRecorder.I.start(act);
+        else {
+            long st = CallRecorder.startedAt;
+            File f = CallRecorder.I.stop();
+            if (f != null) RecUploader.enqueue(act, f, st, System.currentTimeMillis(), true, CallRecorder.peak, CallRecorder.getSource(act));
+        }
         return recStatus();
     }
 
